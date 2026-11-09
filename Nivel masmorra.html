@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Fuga da Masmorra</title>
+<style>
+:root{color-scheme:dark;--bg:#0d0b12;--fg:#efe8d8;--muted:#9a90ad;--line:#2b2438;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,"Segoe UI",sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:10px;padding:8px;touch-action:manipulation;user-select:none}
+canvas{width:min(100%,960px);height:auto;aspect-ratio:8/5;border:2px solid var(--line);border-radius:8px;image-rendering:pixelated;background:#000}
+#pad{display:none;gap:12px}
+#pad button{width:76px;height:60px;font-size:26px;border-radius:12px;border:2px solid var(--line);background:#1d1728;color:var(--fg)}
+#pad button:active{background:#3a2d52}
+@media(pointer:coarse){#pad{display:flex}}
+small{color:var(--muted)}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="pad"><button data-k="l">◀</button><button data-k="r">▶</button><button data-k="j">⤒</button></div>
+<small>← → / A D mover · ↑ / W / ESPAÇO pular · ENTER reinicia</small>
+<script>
+"use strict";
+/* ============ CONFIGURAÇÃO (ajuste aqui o balanceamento) ============ */
+const CFG={
+  tile:32,w:800,h:500,
+  gravity:1800,maxFall:900,run:230,accel:2600,jump:700,
+  time:30,coinPts:100,timeBonus:10,
+  lava:{startY:992,speed:50,minCol:29,maxCol:39},            // lava sobe só dentro da torre
+  wall:{speed:200,accel:12,max:330,spawnX:1008,triggerX:912,row:22,rows:5,w:36} // parede do corredor
+};
+const T=CFG.tile,COLS=40,ROWS=28;
+const cv=document.getElementById('c'),ctx=cv.getContext('2d');
+cv.width=CFG.w;cv.height=CFG.h;
+
+/* ============ SPRITES: troque os desenhos por imagens depois ============
+   Para usar imagem própria:  loadSprite('player','assets/player.png');
+   Sem imagem, o jogo usa o desenho padrão (fb) feito com formas/emoji.   */
+const Sprites={};
+function defSprite(n,fb){Sprites[n]={img:null,fb}}
+function loadSprite(n,src){const i=new Image();i.onload=()=>{Sprites[n].img=i};i.src=src}
+function drawSprite(n,x,y,w,h,e){const s=Sprites[n];s.img?ctx.drawImage(s.img,x,y,w,h):s.fb(x,y,w,h,e)}
+
+defSprite('wall',(x,y,w,h,e)=>{
+  ctx.fillStyle='#352d44';ctx.fillRect(x,y,w,h);
+  ctx.fillStyle='#241e30';ctx.fillRect(x,y+15,w,2);ctx.fillRect(x+16,y,2,16);ctx.fillRect(x+8,y+16,2,16);
+  if(e&&e.top){ctx.fillStyle='#5a4d72';ctx.fillRect(x,y,w,3)}
+});
+defSprite('spike',(x,y,w,h)=>{
+  ctx.fillStyle='#d9dde8';
+  for(let i=0;i<2;i++){ctx.beginPath();ctx.moveTo(x+i*16,y+h);ctx.lineTo(x+i*16+8,y+8);ctx.lineTo(x+i*16+16,y+h);ctx.fill()}
+});
+defSprite('exit',(x,y,w,h)=>{ctx.font=Math.round(h*.8)+'px serif';ctx.fillText('🚪',x,y+h*.82)});
+defSprite('coin',(x,y,w,h)=>{
+  ctx.fillStyle='#ffd166';ctx.beginPath();ctx.arc(x+w/2,y+h/2,w/2,0,7);ctx.fill();
+  ctx.fillStyle='#fff3b0';ctx.beginPath();ctx.arc(x+w/2-3,y+h/2-3,3,0,7);ctx.fill();
+});
+defSprite('player',(x,y,w,h,e)=>{
+  ctx.fillStyle='#f2c14e';ctx.fillRect(x,y,w,h);
+  ctx.fillStyle='#fff';const ex=e.face>0?x+w-9:x+3;ctx.fillRect(ex,y+6,6,6);
+  ctx.fillStyle='#111';ctx.fillRect(ex+(e.face>0?2:1),y+8,3,3);
+});
+defSprite('trap',(x,y,w,h)=>{
+  ctx.fillStyle='#7a1f2b';ctx.fillRect(x,y,w,h);
+  ctx.fillStyle='#d9dde8';
+  for(let i=0;i<h;i+=16){ctx.beginPath();ctx.moveTo(x,y+i);ctx.lineTo(x-14,y+i+8);ctx.lineTo(x,y+i+16);ctx.fill()}
+});
+
+/* ============ FASE (monte novas fases com set/…) ============ */
+let map,coins;
+function buildLevel(){
+  map=Array.from({length:ROWS},()=>Array(COLS).fill('#'));
+  const set=(c,r,w,h,ch)=>{for(let y=r;y<r+h;y++)for(let x=c;x<c+w;x++)map[y][x]=ch};
+  set(29,1,10,26,'.');                 // torre (rota de subida)
+  set(1,22,28,5,'.');                  // corredor (rota esquerda)
+  [[35,24],[29,21],[35,18],[29,15],[35,12],[29,9]].forEach(([c,r])=>set(c,r,4,1,'#')); // plataformas
+  set(33,6,6,1,'#'); set(37,4,1,2,'E'); // saída do topo
+  set(1,25,1,2,'E');                    // saída do corredor
+  [[22,2],[16,3],[10,2],[5,2]].forEach(([c,w])=>set(c,26,w,1,'^')); // espinhos no chão
+  set(13,22,2,2,'#');                   // bloco no teto: não pule alto aqui
+  coins=[[22.5,24.5],[17,24],[10.5,24.5],[5.5,24.5],[3,25.5],
+         [36.5,22.5],[30.5,19.5],[36.5,16.5],[30.5,13.5],[36.5,10.5],[30.5,7.5],[35,4.5]]
+        .map(([c,r])=>({x:c*T,y:r*T,got:false}));
+}
+const cell=(c,r)=>(c<0||r<0||c>=COLS||r>=ROWS)?'#':map[r][c];
+const overlap=(ax,ay,aw,ah,bx,by,bw,bh)=>ax<bx+bw&&ax+aw>bx&&ay<by+bh&&ay+ah>by;
+
+/* ============ ESTADO ============ */
+let state='menu',p,t,timeLeft,score,wall,lavaY,coyote,buf,endAt=0,reason='',route='',best=0,bonus=0;
+try{best=+localStorage.getItem('masmorra_best')||0}catch(e){}
+function reset(){
+  buildLevel();
+  p={x:33*T,y:27*T-28,w:20,h:28,vx:0,vy:0,ground:false,face:-1};
+  t=0;timeLeft=CFG.time;score=0;wall=null;lavaY=CFG.lava.startY;coyote=0;buf=0;
+}
+function start(){if(performance.now()-endAt<500)return;reset();state='play'}
+function die(msg){state='lose';reason=msg;endAt=performance.now()}
+function win(){
+  state='win';bonus=Math.ceil(timeLeft)*CFG.timeBonus;score+=bonus;
+  route=p.x<12*T?'pelo corredor':'pela torre';endAt=performance.now();
+  if(score>best){best=score;try{localStorage.setItem('masmorra_best',best)}catch(e){}}
+}
+
+/* ============ ENTRADA ============ */
+const keys={l:0,r:0};
+function press(){state!=='play'?start():buf=.12}
+function release(){if(p&&p.vy<-250)p.vy*=.45}
+addEventListener('keydown',e=>{
+  const k=e.key.toLowerCase();
+  if(k==='arrowleft'||k==='a')keys.l=1;
+  else if(k==='arrowright'||k==='d')keys.r=1;
+  else if(k==='arrowup'||k==='w'||k===' '){if(!e.repeat)press()}
+  else if((k==='enter'||k==='r')&&state!=='play')start();
+  if([' ','arrowup','arrowdown','arrowleft','arrowright'].includes(k))e.preventDefault();
+});
+addEventListener('keyup',e=>{
+  const k=e.key.toLowerCase();
+  if(k==='arrowleft'||k==='a')keys.l=0;
+  else if(k==='arrowright'||k==='d')keys.r=0;
+  else if(k==='arrowup'||k==='w'||k===' ')release();
+});
+cv.addEventListener('pointerdown',()=>{if(state!=='play')start()});
+document.querySelectorAll('#pad button').forEach(b=>{
+  const a=b.dataset.k;
+  b.addEventListener('pointerdown',e=>{e.preventDefault();a==='j'?press():keys[a]=1});
+  ['pointerup','pointerleave','pointercancel'].forEach(ev=>b.addEventListener(ev,()=>{a==='j'?release():keys[a]=0}));
+});
+
+/* ============ FÍSICA ============ */
+function hit(axis){
+  const c0=Math.floor(p.x/T),c1=Math.floor((p.x+p.w-.01)/T),r0=Math.floor(p.y/T),r1=Math.floor((p.y+p.h-.01)/T);
+  for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++){
+    if(cell(c,r)!=='#')continue;
+    if(axis==='x'){p.x=p.vx>0?c*T-p.w:(c+1)*T;p.vx=0}
+    else if(p.vy>0){p.y=r*T-p.h;p.vy=0;p.ground=true}
+    else{p.y=(r+1)*T;p.vy=0}
+    return;
+  }
+}
+function update(dt){
+  t+=dt;timeLeft-=dt;
+  const dir=keys.r-keys.l;if(dir)p.face=dir;
+  const tv=dir*CFG.run,a=CFG.accel*dt;
+  p.vx=p.vx<tv?Math.min(tv,p.vx+a):Math.max(tv,p.vx-a);
+  coyote=p.ground?.1:coyote-dt;buf-=dt;
+  if(buf>0&&coyote>0){p.vy=-CFG.jump;buf=0;coyote=0}
+  p.vy=Math.min(p.vy+CFG.gravity*dt,CFG.maxFall);
+  p.x+=p.vx*dt;hit('x');
+  p.ground=false;p.y+=p.vy*dt;hit('y');
+
+  // espinhos e saída
+  const c0=Math.floor(p.x/T)-1,c1=Math.floor((p.x+p.w)/T)+1,r0=Math.floor(p.y/T)-1,r1=Math.floor((p.y+p.h)/T)+1;
+  for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++){
+    const ch=cell(c,r);
+    if(ch==='^'&&overlap(p.x,p.y,p.w,p.h,c*T+4,r*T+14,T-8,T-14))return die('Espetado pelos espinhos!');
+    if(ch==='E'&&overlap(p.x,p.y,p.w,p.h,c*T,r*T,T,T))return win();
+  }
+  // moedas
+  for(const k of coins)if(!k.got&&Math.abs(k.x-p.x-p.w/2)<20&&Math.abs(k.y-p.y-p.h/2)<22){k.got=true;score+=CFG.coinPts}
+  // lava (só na torre)
+  lavaY=CFG.lava.startY-CFG.lava.speed*t;
+  const cx=p.x+p.w/2;
+  if(cx>CFG.lava.minCol*T&&cx<CFG.lava.maxCol*T&&p.y+p.h>lavaY)return die('A lava te alcançou!');
+  // parede de espinhos: acionada ao entrar no corredor
+  const W=CFG.wall;
+  if(!wall&&p.x<W.triggerX)wall={x:W.spawnX,v:W.speed};
+  if(wall){
+    wall.v=Math.min(W.max,wall.v+W.accel*dt);wall.x-=wall.v*dt;
+    if(p.x+p.w>wall.x&&p.y+p.h>W.row*T)return die('Esmagado pela parede de espinhos!');
+  }
+  if(timeLeft<=0){timeLeft=0;die('O tempo esgotou!')}
+}
+
+/* ============ DESENHO ============ */
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+function panel(title,lines,color){
+  ctx.fillStyle='rgba(8,6,12,.82)';ctx.fillRect(60,70,CFG.w-120,CFG.h-140);
+  ctx.textAlign='center';ctx.fillStyle=color;ctx.font='bold 34px monospace';ctx.fillText(title,CFG.w/2,125);
+  ctx.fillStyle='#efe8d8';ctx.font='16px monospace';
+  lines.forEach((l,i)=>ctx.fillText(l,CFG.w/2,170+i*28));ctx.textAlign='left';
+}
+function draw(){
+  ctx.fillStyle='#0e0b14';ctx.fillRect(0,0,CFG.w,CFG.h);
+  const cx=clamp(p.x+p.w/2-CFG.w/2,0,COLS*T-CFG.w),cy=clamp(p.y+p.h/2-CFG.h/2,0,ROWS*T-CFG.h);
+  ctx.save();ctx.translate(-Math.round(cx),-Math.round(cy));
+  const c0=Math.max(0,Math.floor(cx/T)),c1=Math.min(COLS-1,Math.ceil((cx+CFG.w)/T));
+  const r0=Math.max(0,Math.floor(cy/T)),r1=Math.min(ROWS-1,Math.ceil((cy+CFG.h)/T));
+  for(let r=r0;r<=r1;r++)for(let c=c0;c<=c1;c++){
+    const ch=map[r][c],x=c*T,y=r*T;
+    if(ch==='#'){drawSprite('wall',x,y,T,T,{top:r>0&&map[r-1][c]!=='#'});continue}
+    ctx.fillStyle='#1b1626';ctx.fillRect(x,y,T,T);
+    if(ch==='^')drawSprite('spike',x,y,T,T);
+    else if(ch==='E'&&cell(c,r-1)!=='E')drawSprite('exit',x,y,T,T*2);
+  }
+  for(const k of coins)if(!k.got)drawSprite('coin',k.x-10,k.y-10+Math.sin(t*5+k.x)*2,20,20);
+  if(wall)drawSprite('trap',wall.x,CFG.wall.row*T,CFG.wall.w,CFG.wall.rows*T);
+  drawSprite('player',p.x,p.y,p.w,p.h,p);
+  // lava
+  const L=CFG.lava,lx=L.minCol*T,lw=(L.maxCol-L.minCol)*T,bot=ROWS*T+300;
+  const g=ctx.createLinearGradient(0,lavaY,0,lavaY+260);g.addColorStop(0,'#ff8a1f');g.addColorStop(1,'#9c1c0a');
+  ctx.fillStyle=g;ctx.beginPath();ctx.moveTo(lx,bot);ctx.lineTo(lx,lavaY);
+  for(let i=0;i<=lw;i+=16)ctx.lineTo(lx+i,lavaY+Math.sin(i/12+t*4)*3);
+  ctx.lineTo(lx+lw,bot);ctx.fill();
+  ctx.restore();
+
+  // HUD
+  ctx.font='bold 18px monospace';ctx.fillStyle=timeLeft<8?'#ff5d5d':'#efe8d8';
+  ctx.fillText('⏱ '+timeLeft.toFixed(1)+'s',14,28);
+  ctx.fillStyle='#ffd166';ctx.fillText('★ '+score,14,52);
+  ctx.textAlign='right';ctx.fillStyle='#9a90ad';ctx.fillText('Recorde '+best,CFG.w-14,28);ctx.textAlign='left';
+  if(state==='play'&&t<3.5){
+    ctx.textAlign='center';ctx.fillStyle='#ffd166';ctx.font='bold 20px monospace';
+    ctx.fillText('ESCOLHA: ◀ corredor   ou   ▲ torre',CFG.w/2,CFG.h-24);ctx.textAlign='left';
+  }
+  if(state==='menu')panel('FUGA DA MASMORRA',[
+    'O mecanismo de defesa foi ativado!','',
+    '◀ CORREDOR: corra para a esquerda, mas a parede de espinhos te persegue',
+    '▲ TORRE: escale as plataformas antes que a lava suba até você','',
+    'Pegue moedas ★ e chegue a uma porta 🚪 em '+CFG.time+'s','',
+    'ENTER, ESPAÇO ou toque para começar'],'#ffd166');
+  if(state==='win')panel('VOCÊ ESCAPOU!',[
+    'Saída '+route,'Pontuação: '+score+'  (bônus de tempo: +'+bonus+')','Recorde: '+best,'',
+    'ENTER, ESPAÇO ou toque para jogar de novo'],'#7dffa0');
+  if(state==='lose')panel('VOCÊ CAIU...',[
+    reason,'Pontuação: '+score+'   Recorde: '+best,'',
+    'ENTER, ESPAÇO ou toque para tentar de novo'],'#ff6b6b');
+}
+
+/* ============ LOOP ============ */
+reset();
+let last=performance.now();
+(function loop(now){
+  const dt=Math.min(.033,(now-last)/1000);last=now;
+  if(state==='play')update(dt);
+  draw();requestAnimationFrame(loop);
+})(last);
+</script>
+</body>
+</html>
